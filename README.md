@@ -40,7 +40,26 @@ flowchart TD
 | Terraform | `>= 1.5`（编写时本机 1.16.2） |
 | 阿里云身份 | 能创建 RAM 用户 / 角色 / AccessKey，即 `ram:Create*` 一类权限 |
 | ACR 企业版实例 | 探针 P4 / P5 需要一个真实 `InstanceId`；P1 / P2 / P3 / P6 / P7 不需要 |
-| aliyun CLI | 观测探针用。**编写时本机未安装**，见下方「已知的未验证点」 |
+| aliyun CLI | 观测探针全部依赖它，安装见 3.1。为什么探针不写成 Terraform，见文末《附录：为什么探针用 CLI 而不是 Terraform》 |
+
+### 3.1 aliyun CLI 的安装
+
+本机是 Linux AMD64，官方给两条路：
+
+```bash
+# 路线 A：官方安装脚本（会放进 PATH）
+/bin/bash -c "$(curl -fsSL https://aliyuncli.alicdn.com/install.sh)"
+
+# 路线 B：手动放二进制
+curl -LO https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz
+tar -xzf aliyun-cli-linux-latest-amd64.tgz
+sudo mv aliyun /usr/local/bin/aliyun
+
+# 验证
+aliyun version          # 本文档按 v3.5.0（2026-09-07）的文档核对
+```
+
+**不需要 `aliyun configure`。** 探针用 `ALIBABA_CLOUD_*` 环境变量传凭证，配合 `ALIBABA_CLOUD_IGNORE_PROFILE=TRUE` 绕开本机已有的 profile——省掉一层「现在到底在用谁的凭证」的歧义。
 
 ⚠️ **主账号不能调用 `AssumeRole`**（官方限制：该接口只能由 RAM 用户或 RAM 角色调用）。这与本实验的设计一致——调用者是 Terraform 建出来的 RAM 用户，不是主账号。所以请用主账号或带 RAM 管理权限的 RAM 身份去 `terraform apply`，但探针里的调用者始终是那个新建的 RAM 用户。
 
@@ -72,9 +91,11 @@ terraform apply
 
 ## 五、跑探针
 
-### 5.1 一次性：装 aliyun CLI 并确认凭证通路
+**首次尝试**：按 5.1 → 5.2 → 5.3 的顺序走。**已经跑过一次、只是回来复跑**：`terraform apply` 之后 `./scripts/probe.sh` 一条命令。
 
-装好后先跑一条最简单的，确认 CLI 能读到凭证（这一步不通，后面全是假失败）：
+### 5.1 确认 aliyun CLI 与凭证通路（首次先做这步）
+
+CLI 若还没装，见 3.1。装好后先跑一条最简单的，确认 CLI 能读到凭证（这一步不通，后面全是假失败）：
 
 ```bash
 export ALIBABA_CLOUD_IGNORE_PROFILE=TRUE
@@ -153,11 +174,34 @@ terraform destroy
 
 | 未验证点 | 说明 |
 | --- | --- |
-| `scripts/probe.sh` 未实测 | 命令、参数名、环境变量名均按官方文档核对；错误码匹配用的是 `NoPermission` 关键字，CLI 版本不同可能措辞略有差异 |
+| `scripts/probe.sh` 未实测 | 命令、参数名、环境变量名均按官方文档核对（aliyun CLI v3.5.0，2026-09-07）；错误码匹配用的是 `NoPermission` 等关键字，CLI 版本不同可能措辞略有差异 |
 | `cr:PullRepository` 这个动作名 | `cr:GetAuthorizationToken` 已从 OpenAPI 元数据核实（资源类型为「全部资源」）；`cr:PullRepository` 是数据面动作，未在 OpenAPI 元数据里出现，若报权限不足请以官方《使用 RAM 进行访问控制》为准 |
 | `Principal.RAM` 写具体用户 ARN | 官方 `ExternalId` 示例用的是账号 root ARN；钉到具体 RAM 用户是控制台「指定 RAM 用户」的产物形态，本实验按此写法 |
 | 同账号 + 具体用户 ARN 时 `sts:ExternalId` 是否照常生效 | 官方 ExternalId 教程的场景是**跨账号**。如果 P2 报 403 而 P7 报错文本与它一模一样（分不出有无 ExternalId 的差别），先怀疑这一条：临时去掉信任策略里的 `Condition` 复跑 P2 |
 | ACR 拉取本身 | 未包含在内（需要真实实例与网络通路） |
+
+## 附录：为什么探针用 CLI 而不是 Terraform
+
+搭台已经用了 Terraform，自然会问「探针能不能也写成 Terraform」。查了 provider 的实际能力后（alicloud 1.292.0），结论是**大部分能表达，但不该这么做**。
+
+| 探针 | Terraform 能否表达 | 怎么表达 |
+| --- | --- | --- |
+| P1 阴性对照 | 能 | caller 的 AK 配 provider + `data.alicloud_cr_ee_instances`，它内部就调 `GetAuthorizationToken`，失败是硬错误 |
+| P2 扮演 | 能 | provider 的 `assume_role` 块 |
+| P3 验身份 `IdentityType` | **不能** | provider 不暴露 `GetCallerIdentity` |
+| P4 拿到 ACR 凭证 | 能 | 同一个 data source 导出 `temp_username` / `authorization_token` |
+| P4 里「`ExpireTime` 与 STS `Expiration` 取小值」 | **不能** | provider 不暴露 STS 的 `Expiration` |
+| P5 交集语义 | 能 | `assume_role { policy = ... }` |
+| P6 边界 899 / 900 | 能 | `session_expiration` 的合法区间正好是 [900, 43200] |
+| P7 不带 ExternalId 应被拒 | 能 | `assume_role` 支持 `external_id`（v1.207.1+），省略即可 |
+
+三笔代价：
+
+1. **前提会被放宽**：`alicloud_cr_ee_instances` 先调 `cr:ListInstance`、再调 `GetAuthorizationToken`，所以角色策略必须额外带上 `cr:ListInstance`——「角色只有拉取权限」这个前提不再纯净，失败时也分不清挂在哪一层
+2. **「预期失败」不是 Terraform 的原生概念**：P1 / P5 / P6 / P7 都是负向断言，用 Terraform 只能 plan + grep stderr + 人工判读，退出码不区分「该失败的失败」与「不该失败的失败」
+3. **`assume_role` 是 provider 初始化期行为**：一个 root module 配不出「两种身份 × 两组参数」，每条探针要一份目录或一套 alias——约 4~5 份 root module 换 CLI 的 7 行命令
+
+判据：Terraform 擅长「把状态变成目标」，而探针要的是「逐次调一个 API、看它返回什么、看它怎么失败」。**只想确认「这条路走得通」，Terraform-only 就够；想问「语义对不对」，就得让工具能逐次调用并保留错误码。**
 
 ## 参考
 
