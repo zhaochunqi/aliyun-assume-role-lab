@@ -1,5 +1,4 @@
 # 复制成 terraform.tfvars 后填写（*.tfvars 已被 .gitignore 忽略）
-region          = "cn-hangzhou"
-name_prefix     = "lab-assume-role"
-acr_instance_id = "cri-xxxxxxxxxxxx"
-external_id     = "lab-external-id-2026"
+region      = "cn-hangzhou"
+name_prefix = "lab-assume-role"
+external_id = "lab-external-id-2026"

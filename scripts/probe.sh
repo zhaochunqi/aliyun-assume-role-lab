@@ -2,10 +2,10 @@
 #
 # 探针：验证「assume role 换成的是角色权限，不是调用者权限的叠加」
 #
-# ⚠️ 编写环境里没有 aliyun CLI、也没有测试账号，所以本脚本**未实测**。
-#    命令、参数名、环境变量名均按官方文档核对（链接见 README 第八节），
-#    但错误措辞匹配用的是关键字，CLI 版本不同可能略有差异。
-#    首次运行请对照 README 第五节的预期输出逐条看。
+# 靶子动作是 ram:ListUsers：不需要任何真实资源、免费、语义与生产里的
+# 「跨账号拉 ACR 镜像」完全一样（角色有、调用者没有、会话策略可收窄）。
+# 为什么不用 ACR 企业版 cr:GetAuthorizationToken：EE 实例只能包年包月，
+# 基础版 ¥564/月起，见 README 第八节。
 #
 # 用法：
 #   ./scripts/probe.sh
@@ -41,15 +41,14 @@ tfo() { terraform output -raw "$1" 2>/dev/null; }
 REGION="$(tfo region)"
 ROLE_ARN="$(tfo role_arn)"
 EXTERNAL_ID="$(tfo external_id)"
-ACR="$(tfo acr_instance_id)"
 BASE_AK="$(tfo caller_access_key_id)"
 BASE_SK="$(tfo caller_access_key_secret)"
 
 [ -n "$ROLE_ARN" ] || die "取不到 terraform output role_arn，请先 terraform apply。"
 [ -n "$BASE_AK" ] || die "取不到调用者 AK，请先 terraform apply。"
 
-printf 'region      = %s\nrole_arn    = %s\nexternal_id = %s\nacr         = %s\n' \
-  "$REGION" "$ROLE_ARN" "$EXTERNAL_ID" "${ACR:-（未设置，P1/P4/P5 将跳过）}"
+printf 'region      = %s\nrole_arn    = %s\nexternal_id = %s\n' \
+  "$REGION" "$ROLE_ARN" "$EXTERNAL_ID"
 
 # --- 凭证切换 ---------------------------------------------------------------
 # IGNORE_PROFILE 不能省：否则本机 ~/.aliyun/config.json 的默认 profile 可能
@@ -80,9 +79,9 @@ assume() {
     --region "$REGION" "$@" 2>&1
 }
 
-acr_token() {
-  "$CLI" cr GetAuthorizationToken \
-    --InstanceId "$ACR" --ExpiresInHours 1 --region "$REGION" 2>&1
+# 靶子调用：角色有权限、调用者没有的那个动作
+probe_target() {
+  "$CLI" ram ListUsers --region "$REGION" 2>&1
 }
 
 session_ready() {
@@ -97,17 +96,13 @@ load_session() {
 }
 
 # --- P1 阴性对照 ------------------------------------------------------------
-sec "P1 阴性对照：调用者直接向 ACR 要凭证（预期被拒）"
-if [ -z "$ACR" ]; then
-  skip "未设置 acr_instance_id"
+sec "P1 阴性对照：调用者直接调 ram:ListUsers（预期被拒）"
+use_caller
+RES="$(probe_target)"
+if grep -qiE 'NoPermission|Forbidden|AccessDenied|not authorized' <<<"$RES"; then
+  ok "被拒，阴性对照成立"
 else
-  use_caller
-  RES="$(acr_token)"
-  if grep -qiE 'NoPermission|Forbidden|AccessDenied|not authorized' <<<"$RES"; then
-    ok "被拒，阴性对照成立"
-  else
-    bad "未被拒——对照不成立，后面 P4 的成功无法归因到『权限来自角色』" "$RES"
-  fi
+  bad "未被拒——对照不成立，后面 P4 的成功无法归因到『权限来自角色』" "$RES"
 fi
 
 # --- P2 扮演 ----------------------------------------------------------------
@@ -138,37 +133,32 @@ else
 fi
 
 # --- P4 权限 ----------------------------------------------------------------
-sec "P4 用会话凭证向 ACR 要凭证（预期成功）"
-if [ -z "$ACR" ] || [ -z "$ASSUME_OUT" ]; then
-  skip "依赖 acr_instance_id 与 P2"
+sec "P4 用会话凭证调 ram:ListUsers（预期成功）"
+if [ -z "$ASSUME_OUT" ]; then
+  skip "依赖 P2"
 else
-  RES="$(acr_token)"
-  if [ -n "$(jq -r '.AuthorizationToken // empty' <<<"$RES" 2>/dev/null)" ]; then
-    ok "拿到凭证：TempUsername=$(jq -r '.TempUsername' <<<"$RES")  ExpireTime=$(jq -r '.ExpireTime' <<<"$RES")"
-    printf '         对比：会话 Expiration=%s（ExpireTime 应取两者较小值）\n' "${SESS_EXPIRATION:-?}"
+  RES="$(probe_target)"
+  if jq -e '.Users' >/dev/null 2>&1 <<<"$RES"; then
+    ok "成功，列出 $(jq -r '.Users.User | length' <<<"$RES") 个 RAM 用户（角色权限生效）"
   else
-    bad "仍然失败" "$RES"
+    bad "仍然失败——角色侧策略没生效？" "$RES"
   fi
 fi
 
 # --- P5 交集语义 ------------------------------------------------------------
-sec "P5 交集语义：会话策略只给 cr:ListRepository，再要 ACR 凭证应被拒"
-SESSION_POLICY='{"Version":"1","Statement":[{"Effect":"Allow","Action":["cr:ListRepository"],"Resource":["*"]}]}'
-if [ -z "$ACR" ]; then
-  skip "未设置 acr_instance_id"
-else
-  P5_OUT="$(assume 900 --ExternalId "$EXTERNAL_ID" --Policy "$SESSION_POLICY")"
-  if session_ready "$P5_OUT"; then
-    load_session "$P5_OUT"
-    RES="$(acr_token)"
-    if grep -qiE 'NoPermission|Forbidden|AccessDenied|not authorized' <<<"$RES"; then
-      ok "被拒（角色允许 cr:*，但会话策略没给 GetAuthorizationToken）"
-    else
-      bad "未被拒——交集语义不成立" "$RES"
-    fi
+sec "P5 交集语义：会话策略只给 ram:ListPolicies，再调 ListUsers 应被拒"
+SESSION_POLICY='{"Version":"1","Statement":[{"Effect":"Allow","Action":["ram:ListPolicies"],"Resource":["*"]}]}'
+P5_OUT="$(assume 900 --ExternalId "$EXTERNAL_ID" --Policy "$SESSION_POLICY")"
+if session_ready "$P5_OUT"; then
+  load_session "$P5_OUT"
+  RES="$(probe_target)"
+  if grep -qiE 'NoPermission|Forbidden|AccessDenied|not authorized' <<<"$RES"; then
+    ok "被拒（角色允许 ram:ListUsers，但会话策略只给了 ram:ListPolicies）"
   else
-    skip "带会话策略的扮演本身没成功，P5 未覆盖：$(head -c 200 <<<"$P5_OUT" | tr '\n' ' ')"
+    bad "未被拒——交集语义不成立" "$RES"
   fi
+else
+  skip "带会话策略的扮演本身没成功，P5 未覆盖：$(head -c 200 <<<"$P5_OUT" | tr '\n' ' ')"
 fi
 
 # --- P6 边界 ----------------------------------------------------------------

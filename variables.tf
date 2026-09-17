@@ -10,12 +10,6 @@ variable "name_prefix" {
   default     = "lab-assume-role"
 }
 
-variable "acr_instance_id" {
-  description = "ACR 企业版实例 ID（cri-xxxxxxxx）。只影响探针 P4/P5；留空则这两条跳过。"
-  type        = string
-  default     = ""
-}
-
 variable "external_id" {
   description = "信任策略里的 sts:ExternalId 条件值，同时用于 AssumeRole 的 --ExternalId 参数。P7 会故意不带它。"
   type        = string

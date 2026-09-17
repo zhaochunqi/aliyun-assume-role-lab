@@ -20,12 +20,12 @@ output "caller_access_key_secret" {
 }
 
 output "role_name" {
-  value = alicloud_ram_role.acr_reader.role_name
+  value = alicloud_ram_role.read_only.role_name
 }
 
 output "role_arn" {
   description = "AssumeRole 的 --RoleArn"
-  value       = alicloud_ram_role.acr_reader.arn
+  value       = alicloud_ram_role.read_only.arn
 }
 
 output "external_id" {
@@ -35,10 +35,6 @@ output "external_id" {
 
 output "region" {
   value = var.region
-}
-
-output "acr_instance_id" {
-  value = var.acr_instance_id
 }
 
 output "probe_hint" {
